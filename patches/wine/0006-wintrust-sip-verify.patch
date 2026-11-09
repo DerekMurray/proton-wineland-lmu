@@ -1,0 +1,129 @@
+Subject: [PATCH] wintrust: Implement CryptSIPVerifyIndirectData for PE images.
+
+CryptSIPVerifyIndirectData() was a stub that always returned FALSE, so a
+program that checks the Authenticode digest of its own PE file always got a
+mismatch. Assetto Corsa's Custom Shaders Patch does this with its dwrite.dll
+when an AssettoServer with ClientSecurityPlugin requests an integrity check
+(e.g. Shutoko Revival Project servers), so Linux players were kicked with
+"failing the security check".
+
+Hash the PE image with the digest algorithm from the indirect data (using the
+existing pe_image_hash()) and compare it with the signed digest, as Windows does.
+
+diff --git a/dlls/wintrust/crypt.c b/dlls/wintrust/crypt.c
+index ad6f264cffb..74bc73ce5f5 100644
+--- a/dlls/wintrust/crypt.c
++++ b/dlls/wintrust/crypt.c
+@@ -1697,7 +1697,109 @@ BOOL WINAPI CryptSIPRemoveSignedDataMsg(SIP_SUBJECTINFO* pSubjectInfo,
+ BOOL WINAPI CryptSIPVerifyIndirectData(SIP_SUBJECTINFO* pSubjectInfo,
+                                        SIP_INDIRECT_DATA* pIndirectData)
+ {
+-    FIXME("(%p %p) stub\n", pSubjectInfo, pIndirectData);
+- 
+-    return FALSE;
++    HCRYPTPROV prov = 0;
++    HCRYPTHASH hash = 0;
++    HANDLE file;
++    DWORD hash_size, length, err = ERROR_SUCCESS;
++    BYTE *hash_data = NULL;
++    BOOL ret = FALSE, release_prov = FALSE;
++    ALG_ID alg;
++
++    TRACE("(%p %p)\n", pSubjectInfo, pIndirectData);
++
++    if (!pSubjectInfo || !pSubjectInfo->pgSubjectType || !pIndirectData)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    if (memcmp(pSubjectInfo->pgSubjectType, &unknown, sizeof(unknown)))
++    {
++        FIXME("unimplemented for subject type %s\n", debugstr_guid(pSubjectInfo->pgSubjectType));
++        return FALSE;
++    }
++
++    if (!pIndirectData->Data.pszObjId || ((ULONG_PTR)pIndirectData->Data.pszObjId >> 16) == 0 ||
++        strcmp(pIndirectData->Data.pszObjId, SPC_PE_IMAGE_DATA_OBJID))
++    {
++        FIXME("unsupported indirect data type %s\n", debugstr_a(pIndirectData->Data.pszObjId));
++        SetLastError(TRUST_E_SUBJECT_FORM_UNKNOWN);
++        return FALSE;
++    }
++
++    if (!(alg = CertOIDToAlgId(pIndirectData->DigestAlgorithm.pszObjId)))
++    {
++        SetLastError(NTE_BAD_ALGID);
++        return FALSE;
++    }
++
++    if (pSubjectInfo->hFile && pSubjectInfo->hFile != INVALID_HANDLE_VALUE)
++        file = pSubjectInfo->hFile;
++    else
++    {
++        file = CreateFileW(pSubjectInfo->pwsFileName, GENERIC_READ,
++                FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++        if (file == INVALID_HANDLE_VALUE)
++            return FALSE;
++    }
++
++    if (!(prov = pSubjectInfo->hProv))
++    {
++        if (!CryptAcquireContextW(&prov, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
++        {
++            err = GetLastError();
++            goto done;
++        }
++        release_prov = TRUE;
++    }
++
++    if (!CryptCreateHash(prov, alg, 0, 0, &hash))
++    {
++        err = GetLastError();
++        goto done;
++    }
++
++    if (!pe_image_hash(file, hash))
++    {
++        err = TRUST_E_SUBJECT_FORM_UNKNOWN;
++        goto done;
++    }
++
++    length = sizeof(hash_size);
++    if (!CryptGetHashParam(hash, HP_HASHSIZE, (BYTE *)&hash_size, &length, 0))
++    {
++        err = GetLastError();
++        goto done;
++    }
++
++    if (!(hash_data = malloc(hash_size)))
++    {
++        err = ERROR_OUTOFMEMORY;
++        goto done;
++    }
++
++    if (!CryptGetHashParam(hash, HP_HASHVAL, hash_data, &hash_size, 0))
++    {
++        err = GetLastError();
++        goto done;
++    }
++
++    if (hash_size == pIndirectData->Digest.cbData &&
++        !memcmp(hash_data, pIndirectData->Digest.pbData, hash_size))
++        ret = TRUE;
++    else
++        err = TRUST_E_BAD_DIGEST;
++
++done:
++    free(hash_data);
++    if (hash)
++        CryptDestroyHash(hash);
++    if (release_prov)
++        CryptReleaseContext(prov, 0);
++    if (file != pSubjectInfo->hFile)
++        CloseHandle(file);
++    if (!ret)
++        SetLastError(err);
++    TRACE("returning %d\n", ret);
++    return ret;
+ }
